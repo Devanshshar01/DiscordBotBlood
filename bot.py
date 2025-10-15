@@ -12,6 +12,24 @@ import re
 import os
 import secrets
 
+# Try to load configuration values
+try:
+    from config import BotConfig, DatabaseConfig
+except Exception:
+    # Fallbacks if config is missing or misconfigured
+    class BotConfig:  # type: ignore
+        BOT_TOKEN = os.getenv("DISCORD_TOKEN", "")
+        COMMAND_PREFIX = "!"
+        CASE_INSENSITIVE = True
+        BOT_STATUS = discord.Status.online
+        BOT_ACTIVITY = discord.Activity(
+            type=discord.ActivityType.watching,
+            name="over your server | /help",
+        )
+
+    class DatabaseConfig:  # type: ignore
+        DATABASE_NAME = "hybrid_bot.db"
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 
@@ -33,21 +51,33 @@ class HybridBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.all()
         super().__init__(
-            command_prefix='!',
+            command_prefix=getattr(BotConfig, "COMMAND_PREFIX", "!"),
             intents=intents,
             help_command=None,
-            case_insensitive=True
+            case_insensitive=getattr(BotConfig, "CASE_INSENSITIVE", True),
         )
-        
-        self.db_connection = sqlite3.connect('hybrid_bot.db')
+
+        # Use configured database name
+        db_name = getattr(DatabaseConfig, "DATABASE_NAME", "hybrid_bot.db")
+        self.db_connection = sqlite3.connect(db_name, check_same_thread=False)
         self.setup_database()
         
     async def setup_hook(self):
         """Called when the bot is starting up"""
+        # Register all cogs
         await self.add_cog(ModerationCog(self))
+        await self.add_cog(ModerationCog2(self))
         await self.add_cog(TicketCog(self))
         await self.add_cog(LoggingCog(self))
         await self.add_cog(AutoModCog(self))
+        await self.add_cog(UtilityCog(self))
+
+        # Add help command to the slash command tree
+        self.tree.add_command(help_command)
+
+        # Register persistent views (require stable custom_ids)
+        self.add_view(TicketCreateView())
+        self.add_view(TicketControlView())
         await self.tree.sync()
         print(f"Synced slash commands for {self.user}")
 
@@ -119,18 +149,18 @@ class HybridBot(commands.Bot):
         print(f'{self.user} has landed! 🚀')
         print(f'Bot is in {len(self.guilds)} servers')
         
-        # Set bot activity
-        activity = discord.Activity(
-            type=discord.ActivityType.watching, 
-            name="over your server | /help"
-        )
-        await self.change_presence(activity=activity)
+        # Set bot presence from config
+        activity = getattr(BotConfig, "BOT_ACTIVITY", None)
+        status = getattr(BotConfig, "BOT_STATUS", discord.Status.online)
+        await self.change_presence(status=status, activity=activity)
 
 class ModerationCog(commands.Cog):
     def __init__(self, bot: HybridBot):
         self.bot = bot
         
     @app_commands.command(name="ban", description="Ban a member from the server")
+    @app_commands.default_permissions(ban_members=True)
+    @app_commands.guild_only()
     @app_commands.describe(
         member="The member to ban",
         reason="Reason for the ban",
@@ -150,6 +180,17 @@ class ModerationCog(commands.Cog):
         if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
             await interaction.response.send_message("❌ You can't ban someone with a higher or equal role!", ephemeral=True)
             return
+
+        # Validate delete days
+        if delete_days is not None:
+            try:
+                delete_days = int(delete_days)
+            except Exception:
+                await interaction.response.send_message("❌ Invalid delete days value!", ephemeral=True)
+                return
+            if delete_days < 0 or delete_days > 7:
+                await interaction.response.send_message("❌ delete_days must be between 0 and 7.", ephemeral=True)
+                return
 
         try:
             # Log the ban
@@ -189,8 +230,13 @@ class ModerationCog(commands.Cog):
             else:
                 embed.add_field(name="📬 DM Status", value="✅ User notified", inline=True)
             
-            # Ban the member
-            await member.ban(reason=f"[Case #{case_id}] {reason}", delete_message_days=delete_days)
+            # Ban the member (use correct API parameter)
+            delete_seconds = (delete_days or 0) * 24 * 60 * 60
+            await interaction.guild.ban(
+                member,
+                reason=f"[Case #{case_id}] {reason}",
+                delete_message_seconds=delete_seconds,
+            )
             
             await interaction.response.send_message(embed=embed)
             
@@ -203,6 +249,8 @@ class ModerationCog(commands.Cog):
             await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="kick", description="Kick a member from the server")
+    @app_commands.default_permissions(kick_members=True)
+    @app_commands.guild_only()
     @app_commands.describe(
         member="The member to kick",
         reason="Reason for the kick"
@@ -273,6 +321,8 @@ class ModerationCog(commands.Cog):
             await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="mute", description="Mute a member in the server")
+    @app_commands.default_permissions(manage_roles=True)
+    @app_commands.guild_only()
     @app_commands.describe(
         member="The member to mute",
         duration="Duration (e.g., 10m, 1h, 1d)",
@@ -353,6 +403,8 @@ class ModerationCog(commands.Cog):
             await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="warn", description="Warn a member")
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.guild_only()
     @app_commands.describe(
         member="The member to warn",
         reason="Reason for the warning"
@@ -421,6 +473,8 @@ class ModerationCog(commands.Cog):
             await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="modlogs", description="View moderation logs for a user")
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.guild_only()
     @app_commands.describe(member="The member to check logs for")
     async def modlogs(self, interaction: discord.Interaction, member: discord.Member):
         if not interaction.user.guild_permissions.manage_messages:
@@ -506,6 +560,8 @@ class ModerationCog2(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="clear", description="Clear messages in a channel")
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.guild_only()
     @app_commands.describe(amount="Number of messages to delete (1-100)")
     async def clear(self, interaction: discord.Interaction, amount: int):
         if not interaction.user.guild_permissions.manage_messages:
@@ -536,6 +592,8 @@ class ModerationCog2(commands.Cog):
             await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="unban", description="Unban a user from the server")
+    @app_commands.default_permissions(ban_members=True)
+    @app_commands.guild_only()
     @app_commands.describe(user_id="The ID of the user to unban")
     async def unban(self, interaction: discord.Interaction, user_id: str):
         if not interaction.user.guild_permissions.ban_members:
@@ -572,6 +630,8 @@ class TicketCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="ticket-setup", description="Set up the ticket system")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
     @app_commands.describe(
         channel="Channel to send the ticket panel to",
         category="Category to create tickets in"
@@ -617,6 +677,8 @@ class TicketCog(commands.Cog):
             await interaction.response.send_message(f"❌ Failed to set up ticket system: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="ticket-stats", description="View ticket statistics")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
     async def ticket_stats(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("❌ You don't have permission to view ticket stats!", ephemeral=True)
@@ -669,6 +731,7 @@ class TicketCreateView(discord.ui.View):
         placeholder="Select a ticket category...",
         min_values=1,
         max_values=1,
+        custom_id="ticket_create_select",
         options=[
             discord.SelectOption(
                 label="General Support",
@@ -824,7 +887,7 @@ class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, emoji="🔒")
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="ticket_close_button")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         bot = interaction.client
         cursor = bot.db_connection.cursor()
@@ -857,7 +920,7 @@ class TicketControlView(discord.ui.View):
         view = TicketCloseConfirmView()
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.primary, emoji="🎯")
+    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.primary, emoji="🎯", custom_id="ticket_claim_button")
     async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.manage_messages:
             await interaction.response.send_message("❌ You don't have permission to claim tickets!", ephemeral=True)
@@ -884,7 +947,7 @@ class TicketCloseConfirmView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
 
-    @discord.ui.button(label="Yes, Close", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Yes, Close", style=discord.ButtonStyle.danger, custom_id="ticket_confirm_close_button")
     async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         bot = interaction.client
         cursor = bot.db_connection.cursor()
@@ -915,7 +978,7 @@ class TicketCloseConfirmView(discord.ui.View):
         except:
             pass
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="ticket_cancel_close_button")
     async def cancel_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="❌ Ticket closure cancelled.", embed=None, view=None)
 
@@ -1169,6 +1232,7 @@ class UtilityCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="serverinfo", description="Get information about the server")
+    @app_commands.guild_only()
     async def serverinfo(self, interaction: discord.Interaction):
         guild = interaction.guild
         
@@ -1197,6 +1261,8 @@ class UtilityCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="setup-modlog", description="Set up moderation logging")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
     @app_commands.describe(channel="Channel to send moderation logs to")
     async def setup_modlog(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if not interaction.user.guild_permissions.manage_guild:
@@ -1262,34 +1328,12 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 if __name__ == "__main__":
-    # Create bot instance
+    # Create bot instance and run
     bot = HybridBot()
-    
-    # Add all cogs
-    async def setup():
-        await bot.add_cog(ModerationCog2(bot))
-        await bot.add_cog(UtilityCog(bot))
-        bot.tree.add_command(help_command)
-    
-    # Run setup
-    asyncio.run(setup())
-    
-    # Replace with your bot token
-    # bot.run("BOT_TOKEN")
-    
-    print("🚀 Hybrid Discord Bot Ready!")
-    print("Features included:")
-    print("✅ Complete moderation suite (ban, kick, mute, warn, clear, unban)")
-    print("✅ Advanced ticket system with categories and claiming")
-    print("✅ Auto-moderation (spam, invites, mass mentions)")
-    print("✅ Comprehensive logging system")
-    print("✅ Beautiful embeds and modern UI")
-    print("✅ SQLite database for persistent data")
-    print("✅ Utility commands (userinfo, serverinfo)")
-    print("✅ Help system")
-    print("\n📋 Setup Instructions:")
-    print("1. Install dependencies: pip install discord.py")
-    print("2. Create a bot at: https://discord.com/developers/applications")
-    print("3. Replace 'YOUR_BOT_TOKEN_HERE' with your actual bot token")
-    print("4. Run the bot and use /ticket-setup and /setup-modlog to configure")
-    print("5. Give the bot necessary permissions in your server")
+
+    # Determine token from environment or config
+    token = os.getenv("DISCORD_TOKEN") or getattr(BotConfig, "BOT_TOKEN", "")
+    if not token or token == "YOUR_BOT_TOKEN_HERE":
+        print("❌ No Discord token provided. Set DISCORD_TOKEN env var or config.BotConfig.BOT_TOKEN.")
+    else:
+        bot.run(token)
