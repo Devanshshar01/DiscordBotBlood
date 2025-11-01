@@ -11,6 +11,8 @@ from enum import Enum
 import re
 import os
 import secrets
+from collections import defaultdict
+import traceback
 
 # Try to load configuration values
 try:
@@ -57,9 +59,10 @@ class HybridBot(commands.Bot):
             case_insensitive=getattr(BotConfig, "CASE_INSENSITIVE", True),
         )
 
-        # Use configured database name
+        # Use configured database name with proper thread safety
         db_name = getattr(DatabaseConfig, "DATABASE_NAME", "hybrid_bot.db")
         self.db_connection = sqlite3.connect(db_name, check_same_thread=False)
+        self.db_lock = asyncio.Lock()  # Thread-safe database operations
         self.setup_database()
         
     async def setup_hook(self):
@@ -74,12 +77,46 @@ class HybridBot(commands.Bot):
 
         # Add help command to the slash command tree
         self.tree.add_command(help_command)
+        
+        # Set up global error handler
+        self.tree.on_error = self.on_app_command_error
 
         # Register persistent views (require stable custom_ids)
         self.add_view(TicketCreateView())
         self.add_view(TicketControlView())
         await self.tree.sync()
         print(f"Synced slash commands for {self.user}")
+    
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Global error handler for slash commands"""
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f"⏱️ This command is on cooldown. Try again in {error.retry_after:.1f}s",
+                ephemeral=True
+            )
+        elif isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                "❌ You don't have permission to use this command!",
+                ephemeral=True
+            )
+        elif isinstance(error, app_commands.BotMissingPermissions):
+            await interaction.response.send_message(
+                "❌ I don't have the required permissions to execute this command!",
+                ephemeral=True
+            )
+        else:
+            logging.error(f"Command error: {error}")
+            logging.error(traceback.format_exc())
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ An error occurred: {str(error)}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ An error occurred: {str(error)}",
+                    ephemeral=True
+                )
 
     def setup_database(self):
         """Set up the SQLite database"""
@@ -173,12 +210,13 @@ class ModerationCog(commands.Cog):
         reason: Optional[str] = "No reason provided",
         delete_days: Optional[int] = 1
     ):
-        if not interaction.user.guild_permissions.ban_members:
-            await interaction.response.send_message("❌ You don't have permission to ban members!", ephemeral=True)
-            return
-            
+        # Check role hierarchy
         if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
             await interaction.response.send_message("❌ You can't ban someone with a higher or equal role!", ephemeral=True)
+            return
+        
+        if member == interaction.guild.owner:
+            await interaction.response.send_message("❌ You can't ban the server owner!", ephemeral=True)
             return
 
         # Validate delete days
@@ -193,14 +231,15 @@ class ModerationCog(commands.Cog):
                 return
 
         try:
-            # Log the ban
-            cursor = self.bot.db_connection.cursor()
-            cursor.execute('''
-                INSERT INTO mod_logs (user_id, moderator_id, action, reason, guild_id)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (member.id, interaction.user.id, 'ban', reason, interaction.guild_id))
-            case_id = cursor.lastrowid
-            self.bot.db_connection.commit()
+            # Log the ban with async lock
+            async with self.bot.db_lock:
+                cursor = self.bot.db_connection.cursor()
+                cursor.execute('''
+                    INSERT INTO mod_logs (user_id, moderator_id, action, reason, guild_id)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (member.id, interaction.user.id, 'ban', reason, interaction.guild_id))
+                case_id = cursor.lastrowid
+                self.bot.db_connection.commit()
             
             # Create ban embed
             embed = discord.Embed(
@@ -261,23 +300,20 @@ class ModerationCog(commands.Cog):
         member: discord.Member,
         reason: Optional[str] = "No reason provided"
     ):
-        if not interaction.user.guild_permissions.kick_members:
-            await interaction.response.send_message("❌ You don't have permission to kick members!", ephemeral=True)
-            return
-            
         if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
             await interaction.response.send_message("❌ You can't kick someone with a higher or equal role!", ephemeral=True)
             return
 
         try:
             # Log the kick
-            cursor = self.bot.db_connection.cursor()
-            cursor.execute('''
-                INSERT INTO mod_logs (user_id, moderator_id, action, reason, guild_id)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (member.id, interaction.user.id, 'kick', reason, interaction.guild_id))
-            case_id = cursor.lastrowid
-            self.bot.db_connection.commit()
+            async with self.bot.db_lock:
+                cursor = self.bot.db_connection.cursor()
+                cursor.execute('''
+                    INSERT INTO mod_logs (user_id, moderator_id, action, reason, guild_id)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (member.id, interaction.user.id, 'kick', reason, interaction.guild_id))
+                case_id = cursor.lastrowid
+                self.bot.db_connection.commit()
             
             # Create kick embed
             embed = discord.Embed(
@@ -321,7 +357,7 @@ class ModerationCog(commands.Cog):
             await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="mute", description="Mute a member in the server")
-    @app_commands.default_permissions(manage_roles=True)
+    @app_commands.default_permissions(moderate_members=True)
     @app_commands.guild_only()
     @app_commands.describe(
         member="The member to mute",
@@ -335,9 +371,6 @@ class ModerationCog(commands.Cog):
         duration: Optional[str] = None,
         reason: Optional[str] = "No reason provided"
     ):
-        if not interaction.user.guild_permissions.manage_roles:
-            await interaction.response.send_message("❌ You don't have permission to mute members!", ephemeral=True)
-            return
 
         # Parse duration
         mute_time = None
@@ -370,13 +403,14 @@ class ModerationCog(commands.Cog):
                 duration_text = f"for {duration}" if duration else "indefinitely"
 
             # Log the mute
-            cursor = self.bot.db_connection.cursor()
-            cursor.execute('''
-                INSERT INTO mod_logs (user_id, moderator_id, action, reason, guild_id)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (member.id, interaction.user.id, 'mute', reason, interaction.guild_id))
-            case_id = cursor.lastrowid
-            self.bot.db_connection.commit()
+            async with self.bot.db_lock:
+                cursor = self.bot.db_connection.cursor()
+                cursor.execute('''
+                    INSERT INTO mod_logs (user_id, moderator_id, action, reason, guild_id)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (member.id, interaction.user.id, 'mute', reason, interaction.guild_id))
+                case_id = cursor.lastrowid
+                self.bot.db_connection.commit()
 
             # Create mute embed
             embed = discord.Embed(
@@ -415,25 +449,22 @@ class ModerationCog(commands.Cog):
         member: discord.Member,
         reason: str
     ):
-        if not interaction.user.guild_permissions.manage_messages:
-            await interaction.response.send_message("❌ You don't have permission to warn members!", ephemeral=True)
-            return
-
         try:
             # Add warning to database
-            cursor = self.bot.db_connection.cursor()
-            cursor.execute('''
-                INSERT INTO warnings (user_id, moderator_id, reason, guild_id)
-                VALUES (?, ?, ?, ?)
-            ''', (member.id, interaction.user.id, reason, interaction.guild_id))
-            
-            # Get warning count
-            cursor.execute('''
-                SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ?
-            ''', (member.id, interaction.guild_id))
-            warning_count = cursor.fetchone()[0]
-            
-            self.bot.db_connection.commit()
+            async with self.bot.db_lock:
+                cursor = self.bot.db_connection.cursor()
+                cursor.execute('''
+                    INSERT INTO warnings (user_id, moderator_id, reason, guild_id)
+                    VALUES (?, ?, ?, ?)
+                ''', (member.id, interaction.user.id, reason, interaction.guild_id))
+                
+                # Get warning count
+                cursor.execute('''
+                    SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ?
+                ''', (member.id, interaction.guild_id))
+                warning_count = cursor.fetchone()[0]
+                
+                self.bot.db_connection.commit()
 
             # Create warning embed
             embed = discord.Embed(
@@ -477,18 +508,15 @@ class ModerationCog(commands.Cog):
     @app_commands.guild_only()
     @app_commands.describe(member="The member to check logs for")
     async def modlogs(self, interaction: discord.Interaction, member: discord.Member):
-        if not interaction.user.guild_permissions.manage_messages:
-            await interaction.response.send_message("❌ You don't have permission to view moderation logs!", ephemeral=True)
-            return
-
-        cursor = self.bot.db_connection.cursor()
-        cursor.execute('''
-            SELECT action, reason, timestamp, moderator_id, id
-            FROM mod_logs 
-            WHERE user_id = ? AND guild_id = ? 
-            ORDER BY timestamp DESC 
-            LIMIT 10
-        ''', (member.id, interaction.guild_id))
+        async with self.bot.db_lock:
+            cursor = self.bot.db_connection.cursor()
+            cursor.execute('''
+                SELECT action, reason, timestamp, moderator_id, id
+                FROM mod_logs 
+                WHERE user_id = ? AND guild_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT 10
+            ''', (member.id, interaction.guild_id))
         
         logs = cursor.fetchall()
         
@@ -564,9 +592,6 @@ class ModerationCog2(commands.Cog):
     @app_commands.guild_only()
     @app_commands.describe(amount="Number of messages to delete (1-100)")
     async def clear(self, interaction: discord.Interaction, amount: int):
-        if not interaction.user.guild_permissions.manage_messages:
-            await interaction.response.send_message("❌ You don't have permission to manage messages!", ephemeral=True)
-            return
         
         if amount < 1 or amount > 100:
             await interaction.response.send_message("❌ Please specify a number between 1 and 100!", ephemeral=True)
@@ -596,9 +621,6 @@ class ModerationCog2(commands.Cog):
     @app_commands.guild_only()
     @app_commands.describe(user_id="The ID of the user to unban")
     async def unban(self, interaction: discord.Interaction, user_id: str):
-        if not interaction.user.guild_permissions.ban_members:
-            await interaction.response.send_message("❌ You don't have permission to unban members!", ephemeral=True)
-            return
 
         try:
             user_id = int(user_id)
@@ -625,6 +647,38 @@ class ModerationCog2(commands.Cog):
         except Exception as e:
             await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
+    @app_commands.command(name="unmute", description="Unmute a member in the server")
+    @app_commands.default_permissions(moderate_members=True)
+    @app_commands.guild_only()
+    @app_commands.describe(member="The member to unmute")
+    async def unmute(self, interaction: discord.Interaction, member: discord.Member):
+        try:
+            # Try removing Discord timeout first
+            if member.is_timed_out():
+                await member.timeout(None, reason=f"Unmuted by {interaction.user}")
+            
+            # Also try removing Muted role if it exists
+            mute_role = discord.utils.get(interaction.guild.roles, name="Muted")
+            if mute_role and mute_role in member.roles:
+                await member.remove_roles(mute_role, reason=f"Unmuted by {interaction.user}")
+            
+            embed = discord.Embed(
+                title="🔊 Member Unmuted",
+                description=f"**{member}** has been unmuted.",
+                color=discord.Color.green(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            embed.add_field(name="👤 User", value=f"{member} ({member.id})", inline=True)
+            embed.add_field(name="🛡️ Moderator", value=interaction.user.mention, inline=True)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            
+            await interaction.response.send_message(embed=embed)
+            
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ I don't have permission to unmute this member!", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
 class TicketCog(commands.Cog):
     def __init__(self, bot: HybridBot):
         self.bot = bot
@@ -642,17 +696,14 @@ class TicketCog(commands.Cog):
         channel: discord.TextChannel,
         category: discord.CategoryChannel
     ):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ You don't have permission to set up tickets!", ephemeral=True)
-            return
-
         # Update guild settings
-        cursor = self.bot.db_connection.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO guild_settings (guild_id, ticket_category)
-            VALUES (?, ?)
-        ''', (interaction.guild_id, category.id))
-        self.bot.db_connection.commit()
+        async with self.bot.db_lock:
+            cursor = self.bot.db_connection.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO guild_settings (guild_id, ticket_category)
+                VALUES (?, ?)
+            ''', (interaction.guild_id, category.id))
+            self.bot.db_connection.commit()
 
         # Create ticket panel
         embed = discord.Embed(
@@ -680,31 +731,28 @@ class TicketCog(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.guild_only()
     async def ticket_stats(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ You don't have permission to view ticket stats!", ephemeral=True)
-            return
-
-        cursor = self.bot.db_connection.cursor()
-        
-        # Get total tickets
-        cursor.execute('SELECT COUNT(*) FROM tickets WHERE guild_id = ?', (interaction.guild_id,))
-        total_tickets = cursor.fetchone()[0]
-        
-        # Get open tickets
-        cursor.execute('SELECT COUNT(*) FROM tickets WHERE guild_id = ? AND status = "open"', (interaction.guild_id,))
-        open_tickets = cursor.fetchone()[0]
-        
-        # Get closed tickets
-        cursor.execute('SELECT COUNT(*) FROM tickets WHERE guild_id = ? AND status = "closed"', (interaction.guild_id,))
-        closed_tickets = cursor.fetchone()[0]
-        
-        # Get tickets by category
-        cursor.execute('''
-            SELECT category, COUNT(*) FROM tickets 
-            WHERE guild_id = ? 
-            GROUP BY category
-        ''', (interaction.guild_id,))
-        category_stats = cursor.fetchall()
+        async with self.bot.db_lock:
+            cursor = self.bot.db_connection.cursor()
+            
+            # Get total tickets
+            cursor.execute('SELECT COUNT(*) FROM tickets WHERE guild_id = ?', (interaction.guild_id,))
+            total_tickets = cursor.fetchone()[0]
+            
+            # Get open tickets
+            cursor.execute('SELECT COUNT(*) FROM tickets WHERE guild_id = ? AND status = "open"', (interaction.guild_id,))
+            open_tickets = cursor.fetchone()[0]
+            
+            # Get closed tickets
+            cursor.execute('SELECT COUNT(*) FROM tickets WHERE guild_id = ? AND status = "closed"', (interaction.guild_id,))
+            closed_tickets = cursor.fetchone()[0]
+            
+            # Get tickets by category
+            cursor.execute('''
+                SELECT category, COUNT(*) FROM tickets 
+                WHERE guild_id = ? 
+                GROUP BY category
+            ''', (interaction.guild_id,))
+            category_stats = cursor.fetchall()
 
         embed = discord.Embed(
             title="📊 Ticket Statistics",
@@ -986,12 +1034,30 @@ class TicketCloseConfirmView(discord.ui.View):
 class AutoModCog(commands.Cog):
     def __init__(self, bot: HybridBot):
         self.bot = bot
-        self.spam_cache = {}
-        self.invite_pattern = re.compile(r'discord(?:app)?\.(?:com|gg)/(?:invite/)?([a-zA-Z0-9-]+)')
+        self.spam_cache = defaultdict(lambda: defaultdict(list))
+        self.invite_pattern = re.compile(r'discord(?:app)?\.(?: com|gg)/(?:invite/)?([a-zA-Z0-9-]+)')
+        
+        # Load config values
+        try:
+            from config import ModerationConfig
+            self.spam_threshold = getattr(ModerationConfig, 'SPAM_THRESHOLD', 5)
+            self.spam_timeout = getattr(ModerationConfig, 'SPAM_TIMEOUT_DURATION', 5)
+            self.mass_mention_threshold = getattr(ModerationConfig, 'MASS_MENTION_THRESHOLD', 5)
+            self.mass_mention_timeout = getattr(ModerationConfig, 'MASS_MENTION_TIMEOUT', 10)
+        except:
+            # Fallback values
+            self.spam_threshold = 5
+            self.spam_timeout = 5
+            self.mass_mention_threshold = 5
+            self.mass_mention_timeout = 10
         
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
+            return
+        
+        # Skip auto-mod for moderators
+        if message.author.guild_permissions.manage_messages:
             return
             
         # Check for spam
@@ -1007,39 +1073,34 @@ class AutoModCog(commands.Cog):
         """Check for spam messages"""
         user_id = message.author.id
         channel_id = message.channel.id
-        
-        # Initialize cache for user if not exists
-        if user_id not in self.spam_cache:
-            self.spam_cache[user_id] = {}
-        
-        if channel_id not in self.spam_cache[user_id]:
-            self.spam_cache[user_id][channel_id] = []
+        current_time = datetime.datetime.utcnow()
         
         # Add current message timestamp
-        current_time = datetime.datetime.utcnow()
         self.spam_cache[user_id][channel_id].append(current_time)
         
-        # Remove messages older than 5 seconds
+        # Remove messages older than 5 seconds (prevent unbounded growth)
+        cutoff = current_time - datetime.timedelta(seconds=5)
         self.spam_cache[user_id][channel_id] = [
-            timestamp for timestamp in self.spam_cache[user_id][channel_id]
-            if current_time - timestamp <= datetime.timedelta(seconds=5)
+            ts for ts in self.spam_cache[user_id][channel_id] if ts > cutoff
         ]
         
-        # Check if user sent more than 5 messages in 5 seconds
-        if len(self.spam_cache[user_id][channel_id]) > 5:
+        # Check if user exceeded spam threshold
+        if len(self.spam_cache[user_id][channel_id]) > self.spam_threshold:
             try:
                 # Delete recent messages
-                async for msg in message.channel.history(limit=10):
+                deleted_count = 0
+                async for msg in message.channel.history(limit=15):
                     if (msg.author.id == user_id and 
                         current_time - msg.created_at <= datetime.timedelta(seconds=5)):
                         try:
                             await msg.delete()
+                            deleted_count += 1
                         except:
                             pass
                 
                 # Timeout the user
                 await message.author.timeout(
-                    datetime.timedelta(minutes=5),
+                    datetime.timedelta(minutes=self.spam_timeout),
                     reason="Auto-mod: Spam detection"
                 )
                 
@@ -1049,24 +1110,23 @@ class AutoModCog(commands.Cog):
                     description=f"{message.author.mention} has been timed out for spam.",
                     color=discord.Color.red()
                 )
-                embed.add_field(name="📝 Reason", value="Spam detection (5+ messages in 5 seconds)", inline=False)
-                embed.add_field(name="⏱️ Duration", value="5 minutes", inline=False)
+                embed.add_field(name="📝 Reason", value=f"Spam detection ({self.spam_threshold}+ messages in 5 seconds)", inline=False)
+                embed.add_field(name="⏱️ Duration", value=f"{self.spam_timeout} minutes", inline=False)
+                embed.add_field(name="🗑️ Deleted", value=f"{deleted_count} messages", inline=False)
                 
                 await message.channel.send(embed=embed, delete_after=10)
                 
                 # Clear cache for user
-                self.spam_cache[user_id][channel_id] = []
+                self.spam_cache[user_id][channel_id].clear()
                 
             except discord.Forbidden:
                 pass
+            except Exception as e:
+                logging.error(f"Spam check error: {e}")
 
     async def check_invites(self, message: discord.Message):
         """Check for Discord invite links"""
         if self.invite_pattern.search(message.content):
-            # Check if user has manage messages permission
-            if message.author.guild_permissions.manage_messages:
-                return
-                
             try:
                 await message.delete()
                 
@@ -1075,23 +1135,26 @@ class AutoModCog(commands.Cog):
                     description=f"{message.author.mention}, Discord invite links are not allowed!",
                     color=discord.Color.orange()
                 )
+                embed.add_field(name="📝 Action", value="Message deleted", inline=False)
                 
                 await message.channel.send(embed=embed, delete_after=5)
                 
             except discord.Forbidden:
                 pass
+            except Exception as e:
+                logging.error(f"Invite check error: {e}")
 
     async def check_mass_mentions(self, message: discord.Message):
         """Check for mass mentions"""
         mention_count = len(message.mentions) + len(message.role_mentions)
         
-        if mention_count > 5:  # More than 5 mentions
+        if mention_count > self.mass_mention_threshold:
             try:
                 await message.delete()
                 
                 # Timeout for mass mentions
                 await message.author.timeout(
-                    datetime.timedelta(minutes=10),
+                    datetime.timedelta(minutes=self.mass_mention_timeout),
                     reason="Auto-mod: Mass mentions"
                 )
                 
@@ -1101,12 +1164,14 @@ class AutoModCog(commands.Cog):
                     color=discord.Color.red()
                 )
                 embed.add_field(name="📝 Reason", value=f"Mass mentions ({mention_count} mentions)", inline=False)
-                embed.add_field(name="⏱️ Duration", value="10 minutes", inline=False)
+                embed.add_field(name="⏱️ Duration", value=f"{self.mass_mention_timeout} minutes", inline=False)
                 
                 await message.channel.send(embed=embed, delete_after=10)
                 
             except discord.Forbidden:
                 pass
+            except Exception as e:
+                logging.error(f"Mass mention check error: {e}")
 
 # Logging cog for comprehensive server logs
 class LoggingCog(commands.Cog):
@@ -1265,16 +1330,13 @@ class UtilityCog(commands.Cog):
     @app_commands.guild_only()
     @app_commands.describe(channel="Channel to send moderation logs to")
     async def setup_modlog(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ You don't have permission to set up moderation logging!", ephemeral=True)
-            return
-
-        cursor = self.bot.db_connection.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO guild_settings (guild_id, modlog_channel)
-            VALUES (?, ?)
-        ''', (interaction.guild_id, channel.id))
-        self.bot.db_connection.commit()
+        async with self.bot.db_lock:
+            cursor = self.bot.db_connection.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO guild_settings (guild_id, modlog_channel)
+                VALUES (?, ?)
+            ''', (interaction.guild_id, channel.id))
+            self.bot.db_connection.commit()
 
         embed = discord.Embed(
             title="✅ Moderation Logging Setup",
@@ -1295,7 +1357,7 @@ async def help_command(interaction: discord.Interaction):
     
     embed.add_field(
         name="🛡️ Moderation Commands",
-        value="`/ban` - Ban a member\n`/kick` - Kick a member\n`/mute` - Mute a member\n`/warn` - Warn a member\n`/clear` - Clear messages\n`/unban` - Unban a user\n`/modlogs` - View user's moderation history",
+        value="`/ban` - Ban a member\n`/kick` - Kick a member\n`/mute` - Mute a member\n`/unmute` - Unmute a member\n`/warn` - Warn a member\n`/clear` - Clear messages\n`/unban` - Unban a user\n`/modlogs` - View user's moderation history",
         inline=False
     )
     

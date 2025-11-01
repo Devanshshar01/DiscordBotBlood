@@ -7,7 +7,7 @@ class BotConfig:
     """Main bot configuration"""
     
     # Bot Token (REQUIRED - Get from Discord Developer Portal)
-    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+    BOT_TOKEN = ""
     
     # Bot Settings
     COMMAND_PREFIX = "!"
