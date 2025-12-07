@@ -14,6 +14,14 @@ import secrets
 from collections import defaultdict
 import traceback
 
+# Load environment variables from .env if present
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 # Try to load configuration values
 try:
     from config import BotConfig, DatabaseConfig
@@ -51,7 +59,11 @@ class ModAction(Enum):
 
 class HybridBot(commands.Bot):
     def __init__(self):
-        intents = discord.Intents.all()
+        # Request only the intents we actually use; message_content is needed for auto-mod.
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        intents.guilds = True
         super().__init__(
             command_prefix=getattr(BotConfig, "COMMAND_PREFIX", "!"),
             intents=intents,
@@ -64,6 +76,14 @@ class HybridBot(commands.Bot):
         self.db_connection = sqlite3.connect(db_name, check_same_thread=False)
         self.db_lock = asyncio.Lock()  # Thread-safe database operations
         self.setup_database()
+
+    async def close(self):
+        # Ensure DB connection closes cleanly on shutdown
+        try:
+            self.db_connection.close()
+        except Exception:
+            pass
+        await super().close()
         
     async def setup_hook(self):
         """Called when the bot is starting up"""
@@ -74,6 +94,12 @@ class HybridBot(commands.Bot):
         await self.add_cog(LoggingCog(self))
         await self.add_cog(AutoModCog(self))
         await self.add_cog(UtilityCog(self))
+        try:
+            from music import MusicCog
+
+            await self.add_cog(MusicCog(self))
+        except Exception as e:
+            logging.error(f"Failed to load MusicCog: {e}")
 
         # Add help command to the slash command tree
         self.tree.add_command(help_command)
@@ -163,6 +189,45 @@ class HybridBot(commands.Bot):
                 guild_id INTEGER NOT NULL,
                 assigned_to INTEGER,
                 priority TEXT DEFAULT 'medium'
+            )
+        ''')
+
+        # Playlists tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS playlist_songs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id INTEGER NOT NULL,
+                song_title TEXT NOT NULL,
+                song_url TEXT NOT NULL,
+                duration INTEGER,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (playlist_id) REFERENCES playlists(id)
+            )
+        ''')
+
+        # Radio tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS radio_channels (
+                guild_id INTEGER PRIMARY KEY,
+                voice_channel_id INTEGER NOT NULL,
+                enabled BOOLEAN DEFAULT 1
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS radio_streams (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                stream_url TEXT NOT NULL,
+                stream_name TEXT NOT NULL
             )
         ''')
         
@@ -380,6 +445,20 @@ class ModerationCog(commands.Cog):
                 await interaction.response.send_message("❌ Invalid duration format! Use formats like: 10m, 1h, 1d", ephemeral=True)
                 return
 
+        # Role hierarchy safety checks
+        if member == interaction.guild.owner:
+            await interaction.response.send_message("❌ You can't mute the server owner!", ephemeral=True)
+            return
+        if member == interaction.user:
+            await interaction.response.send_message("❌ You can't mute yourself!", ephemeral=True)
+            return
+        if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+            await interaction.response.send_message("❌ You can't mute someone with a higher or equal role!", ephemeral=True)
+            return
+        if member.top_role >= interaction.guild.me.top_role:
+            await interaction.response.send_message("❌ I can't mute someone with a higher or equal role than mine!", ephemeral=True)
+            return
+
         try:
             # Use Discord's timeout feature for temporary mutes
             if mute_time and mute_time <= datetime.timedelta(days=28):
@@ -449,6 +528,20 @@ class ModerationCog(commands.Cog):
         member: discord.Member,
         reason: str
     ):
+        # Role hierarchy safety checks
+        if member == interaction.guild.owner:
+            await interaction.response.send_message("❌ You can't warn the server owner!", ephemeral=True)
+            return
+        if member == interaction.user:
+            await interaction.response.send_message("❌ You can't warn yourself!", ephemeral=True)
+            return
+        if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+            await interaction.response.send_message("❌ You can't warn someone with a higher or equal role!", ephemeral=True)
+            return
+        if member.top_role >= interaction.guild.me.top_role:
+            await interaction.response.send_message("❌ I can't warn someone with a higher or equal role than mine!", ephemeral=True)
+            return
+
         try:
             # Add warning to database
             async with self.bot.db_lock:
@@ -652,6 +745,17 @@ class ModerationCog2(commands.Cog):
     @app_commands.guild_only()
     @app_commands.describe(member="The member to unmute")
     async def unmute(self, interaction: discord.Interaction, member: discord.Member):
+        # Role hierarchy safety checks
+        if member == interaction.guild.owner:
+            await interaction.response.send_message("❌ You can't unmute the server owner!", ephemeral=True)
+            return
+        if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+            await interaction.response.send_message("❌ You can't unmute someone with a higher or equal role!", ephemeral=True)
+            return
+        if member.top_role >= interaction.guild.me.top_role:
+            await interaction.response.send_message("❌ I can't unmute someone with a higher or equal role than mine!", ephemeral=True)
+            return
+
         try:
             # Try removing Discord timeout first
             if member.is_timed_out():
@@ -707,17 +811,27 @@ class TicketCog(commands.Cog):
 
         # Create ticket panel
         embed = discord.Embed(
-            title="🎫 Support Tickets",
-            description="Need help? Create a support ticket by selecting a category below!",
-            color=discord.Color.blue()
+            title="🎫 Support Desk",
+            description="Tap a category to open a private ticket with staff.",
+            color=discord.Color.blurple()
         )
         embed.add_field(
-            name="📋 How it works:",
-            value="• Select a category from the dropdown menu below\n• A private channel will be created for you\n• Our staff will assist you as soon as possible\n• Close your ticket when you're done",
+            name="How it works",
+            value="• Pick a category below\n• We create a private channel for you\n• Staff joins and helps\n• Close it when you’re done",
+            inline=False
+        )
+        embed.add_field(
+            name="Response goals",
+            value="Fast for urgent issues, within a few minutes for the rest.",
+            inline=False
+        )
+        embed.add_field(
+            name="Tips",
+            value="Include screenshots, links, and steps to reproduce if applicable.",
             inline=False
         )
         embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild.icon else None)
-        embed.set_footer(text="Click the dropdown below to create a ticket!")
+        embed.set_footer(text="We’re here to help — choose a category below.")
 
         view = TicketCreateView()
         
@@ -755,19 +869,30 @@ class TicketCog(commands.Cog):
             category_stats = cursor.fetchall()
 
         embed = discord.Embed(
-            title="📊 Ticket Statistics",
-            description="Here are the ticket statistics for this server:",
-            color=discord.Color.blue(),
+            title="📊 Ticket Dashboard",
+            description="Snapshot of current support load.",
+            color=discord.Color.teal(),
             timestamp=datetime.datetime.utcnow()
         )
         
-        embed.add_field(name="📈 Total Tickets", value=total_tickets, inline=True)
-        embed.add_field(name="🟢 Open Tickets", value=open_tickets, inline=True)
-        embed.add_field(name="🔴 Closed Tickets", value=closed_tickets, inline=True)
+        embed.add_field(name="Total", value=total_tickets, inline=True)
+        embed.add_field(name="Open", value=open_tickets, inline=True)
+        embed.add_field(name="Closed", value=closed_tickets, inline=True)
+
+        if total_tickets:
+            pct_open = round((open_tickets / total_tickets) * 100, 1)
+            pct_closed = round((closed_tickets / total_tickets) * 100, 1)
+            embed.add_field(
+                name="Status mix",
+                value=f"🟢 {pct_open}% open\n🔴 {pct_closed}% closed",
+                inline=True
+            )
         
         if category_stats:
-            categories_text = "\n".join([f"• **{cat}**: {count}" for cat, count in category_stats])
-            embed.add_field(name="📂 By Category", value=categories_text, inline=False)
+            categories_text = "\n".join([f"• {cat}: {count}" for cat, count in category_stats])
+            embed.add_field(name="By category", value=categories_text, inline=False)
+        else:
+            embed.add_field(name="By category", value="No tickets yet.", inline=False)
         
         await interaction.response.send_message(embed=embed)
 
@@ -819,13 +944,13 @@ class TicketCreateView(discord.ui.View):
     async def create_ticket(self, interaction: discord.Interaction, category: str):
         # Check if user already has an open ticket
         bot = interaction.client
-        cursor = bot.db_connection.cursor()
-        cursor.execute('''
-            SELECT channel_id FROM tickets 
-            WHERE user_id = ? AND guild_id = ? AND status = 'open'
-        ''', (interaction.user.id, interaction.guild_id))
-        
-        existing_ticket = cursor.fetchone()
+        async with bot.db_lock:
+            cursor = bot.db_connection.cursor()
+            cursor.execute('''
+                SELECT channel_id FROM tickets 
+                WHERE user_id = ? AND guild_id = ? AND status = 'open'
+            ''', (interaction.user.id, interaction.guild_id))
+            existing_ticket = cursor.fetchone()
         if existing_ticket:
             channel = interaction.guild.get_channel(existing_ticket[0])
             if channel:
@@ -836,8 +961,10 @@ class TicketCreateView(discord.ui.View):
                 return
 
         # Get ticket category from database
-        cursor.execute('SELECT ticket_category FROM guild_settings WHERE guild_id = ?', (interaction.guild_id,))
-        result = cursor.fetchone()
+        async with bot.db_lock:
+            cursor = bot.db_connection.cursor()
+            cursor.execute('SELECT ticket_category FROM guild_settings WHERE guild_id = ?', (interaction.guild_id,))
+            result = cursor.fetchone()
         
         if not result or not result[0]:
             await interaction.response.send_message(
@@ -877,6 +1004,18 @@ class TicketCreateView(discord.ui.View):
             )
         }
 
+        # Allow staff (any role with manage_messages) to view tickets
+        staff_roles = [role for role in interaction.guild.roles if role.permissions.manage_messages]
+        for role in staff_roles:
+            overwrites[role] = discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=True,
+                embed_links=True,
+                attach_files=True,
+                read_message_history=True,
+                manage_messages=True
+            )
+
         try:
             channel = await ticket_category_channel.create_text_channel(
                 name=f"{category}-{interaction.user.name}",
@@ -885,11 +1024,13 @@ class TicketCreateView(discord.ui.View):
             )
 
             # Add to database
-            cursor.execute('''
-                INSERT INTO tickets (ticket_id, user_id, channel_id, category, guild_id)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (ticket_id, interaction.user.id, channel.id, category, interaction.guild_id))
-            bot.db_connection.commit()
+            async with bot.db_lock:
+                cursor = bot.db_connection.cursor()
+                cursor.execute('''
+                    INSERT INTO tickets (ticket_id, user_id, channel_id, category, guild_id)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (ticket_id, interaction.user.id, channel.id, category, interaction.guild_id))
+                bot.db_connection.commit()
 
             # Create welcome embed
             category_emojis = {
@@ -961,8 +1102,8 @@ class TicketControlView(discord.ui.View):
 
         # Confirm closure
         embed = discord.Embed(
-            title="🔒 Close Ticket",
-            description="Are you sure you want to close this ticket?",
+            title="🔒 Close this ticket?",
+            description="We’ll archive the conversation and delete the channel after confirmation.",
             color=discord.Color.red()
         )
         view = TicketCloseConfirmView()
@@ -975,13 +1116,14 @@ class TicketControlView(discord.ui.View):
             return
 
         bot = interaction.client
-        cursor = bot.db_connection.cursor()
-        
-        # Update ticket assignment
-        cursor.execute('''
-            UPDATE tickets SET assigned_to = ? WHERE channel_id = ?
-        ''', (interaction.user.id, interaction.channel_id))
-        bot.db_connection.commit()
+        async with bot.db_lock:
+            cursor = bot.db_connection.cursor()
+            
+            # Update ticket assignment
+            cursor.execute('''
+                UPDATE tickets SET assigned_to = ? WHERE channel_id = ?
+            ''', (interaction.user.id, interaction.channel_id))
+            bot.db_connection.commit()
 
         embed = discord.Embed(
             title="🎯 Ticket Claimed",
@@ -998,14 +1140,15 @@ class TicketCloseConfirmView(discord.ui.View):
     @discord.ui.button(label="Yes, Close", style=discord.ButtonStyle.danger, custom_id="ticket_confirm_close_button")
     async def confirm_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         bot = interaction.client
-        cursor = bot.db_connection.cursor()
-        
-        # Update ticket status
-        cursor.execute('''
-            UPDATE tickets SET status = 'closed', closed_at = CURRENT_TIMESTAMP 
-            WHERE channel_id = ?
-        ''', (interaction.channel_id,))
-        bot.db_connection.commit()
+        async with bot.db_lock:
+            cursor = bot.db_connection.cursor()
+            
+            # Update ticket status
+            cursor.execute('''
+                UPDATE tickets SET status = 'closed', closed_at = CURRENT_TIMESTAMP 
+                WHERE channel_id = ?
+            ''', (interaction.channel_id,))
+            bot.db_connection.commit()
 
         # Create transcript (simplified)
         transcript = f"Ticket Transcript\n\nTicket closed by: {interaction.user}\nClosed at: {datetime.datetime.utcnow()}\n\n"
@@ -1251,9 +1394,10 @@ class LoggingCog(commands.Cog):
 
     async def send_to_log_channel(self, guild: discord.Guild, embed: discord.Embed, log_type: str):
         """Send log message to appropriate channel"""
-        cursor = self.bot.db_connection.cursor()
-        cursor.execute('SELECT modlog_channel FROM guild_settings WHERE guild_id = ?', (guild.id,))
-        result = cursor.fetchone()
+        async with self.bot.db_lock:
+            cursor = self.bot.db_connection.cursor()
+            cursor.execute('SELECT modlog_channel FROM guild_settings WHERE guild_id = ?', (guild.id,))
+            result = cursor.fetchone()
         
         if result and result[0]:
             channel = guild.get_channel(result[0])

@@ -184,6 +184,17 @@ class PermissionConfig:
     # Logging permissions
     SETUP_LOGS_PERMISSION = "manage_guild"
 
+class MusicConfig:
+    """Music system settings"""
+
+    MAX_QUEUE_SIZE = 50
+    MAX_SONG_DURATION = 600  # seconds
+    INACTIVITY_TIMEOUT = 300  # seconds
+    DEFAULT_VOLUME = 50  # percent
+    ENABLE_VOTE_SKIP = True
+    VOTE_SKIP_RATIO = 0.5
+    SEARCH_RESULTS_LIMIT = 5
+
 class CustomizationConfig:
     """Custom messages and responses"""
     
